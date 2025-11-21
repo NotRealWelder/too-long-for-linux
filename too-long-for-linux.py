@@ -2,7 +2,7 @@
 """
 Проверка длинных путей и имен файлов для Linux с учетом системных ограничений
 Используйте ./too-long-for-linux.py --help для вывода справки
-v0.4 от 20.11.25
+v0.4 от 21.11.25
 """
 
 import argparse
@@ -326,10 +326,9 @@ def parse_arguments():
 
 
 def get_auto_log_name():
-    """Генерирует автоматическое имя лог-файла на основе имени текущей директории"""
     cwd = Path.cwd()
     basename = cwd.name
-    if not basename:  # Если текущая директория - корневая
+    if not basename:
         basename = "root"
     return f"{basename}.LOG"
 
@@ -341,9 +340,7 @@ def validate_directory(directory):
 
 
 def write_log_report(log_file, problems, mode="a"):
-    """Записывает результаты в лог-файл с возможностью дописывания"""
     with Path(log_file).open(mode, encoding="utf-8") as file:
-        # Добавляем разделитель с датой и временем при дописывании
         if mode == "a":
             file.write(f"\n{'=' * 60}\n")
             file.write(f"Проверка от {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -442,13 +439,12 @@ def main():
     args = parse_arguments()
     validate_directory(args.directory)
 
-    # Определяем имя лог-файла
     log_file_name = None
     if args.log == "AUTO":
         log_file_name = get_auto_log_name()
     elif args.log is not None:
         log_file_name = args.log
-    elif len(sys.argv) == 1:  # Запуск без аргументов
+    elif len(sys.argv) == 1:
         log_file_name = get_auto_log_name()
 
     try:
@@ -458,7 +454,6 @@ def main():
             apply_fixes(problems)
             problems, total = scan_directory(args.directory, not args.no_progress)
 
-        # Записываем в лог, если требуется
         if log_file_name:
             write_log_report(log_file_name, problems, "a")
 
