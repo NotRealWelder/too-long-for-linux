@@ -2,7 +2,7 @@
 """
 Проверка длинных путей и имен файлов для Linux с учетом системных ограничений
 Используйте ./too-long-for-linux.py --help для вывода справки
-v0.3 от 20.11.25
+v0.4 от 20.11.25
 """
 
 import argparse
@@ -10,6 +10,7 @@ import contextlib
 import os
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -308,7 +309,12 @@ def parse_arguments():
         "-q", "--quiet", action="store_true", help="Тихий режим (только цифры)"
     )
     parser.add_argument(
-        "-l", "--log", metavar="ФАЙЛ", help="Сохранить результаты в указанный файл"
+        "-l",
+        "--log",
+        nargs="?",
+        const="AUTO",
+        metavar="ФАЙЛ",
+        help="Сохранить результаты в указанный файл (если указан без файла, используется автоматическое имя)",
     )
     parser.add_argument(
         "--axe",
@@ -319,19 +325,38 @@ def parse_arguments():
     return parser.parse_args()
 
 
+def get_auto_log_name():
+    """Генерирует автоматическое имя лог-файла на основе имени текущей директории"""
+    cwd = Path.cwd()
+    basename = cwd.name
+    if not basename:  # Если текущая директория - корневая
+        basename = "root"
+    return f"{basename}.LOG"
+
+
 def validate_directory(directory):
     if not Path(directory).is_dir():
         print(f"Ошибка: Директория '{directory}' не существует", file=sys.stderr)
         sys.exit(1)
 
 
-def save_results_to_log(log_file, problems):
-    with Path(log_file).open("w", encoding="utf-8") as file:
-        for problem_type, length, path in problems:
-            if "NAME" in problem_type:
-                file.write(f"ДЛИННОЕ ИМЯ [{length}/255]: {path}\n")
-            else:
-                file.write(f"ДЛИННЫЙ ПУТЬ [{length}/4096]: {path}\n")
+def write_log_report(log_file, problems, mode="a"):
+    """Записывает результаты в лог-файл с возможностью дописывания"""
+    with Path(log_file).open(mode, encoding="utf-8") as file:
+        # Добавляем разделитель с датой и временем при дописывании
+        if mode == "a":
+            file.write(f"\n{'=' * 60}\n")
+            file.write(f"Проверка от {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            file.write(f"{'=' * 60}\n")
+
+        if problems:
+            for problem_type, length, path in problems:
+                if "NAME" in problem_type:
+                    file.write(f"ДЛИННОЕ ИМЯ [{length}/255]: {path}\n")
+                else:
+                    file.write(f"ДЛИННЫЙ ПУТЬ [{length}/4096]: {path}\n")
+        else:
+            file.write("Все пути и имена соответствуют ограничениям Linux\n")
 
 
 def apply_fixes(problems):
@@ -417,6 +442,15 @@ def main():
     args = parse_arguments()
     validate_directory(args.directory)
 
+    # Определяем имя лог-файла
+    log_file_name = None
+    if args.log == "AUTO":
+        log_file_name = get_auto_log_name()
+    elif args.log is not None:
+        log_file_name = args.log
+    elif len(sys.argv) == 1:  # Запуск без аргументов
+        log_file_name = get_auto_log_name()
+
     try:
         problems, total = scan_directory(args.directory, not args.no_progress)
 
@@ -424,10 +458,11 @@ def main():
             apply_fixes(problems)
             problems, total = scan_directory(args.directory, not args.no_progress)
 
-        if args.log:
-            save_results_to_log(args.log, problems)
+        # Записываем в лог, если требуется
+        if log_file_name:
+            write_log_report(log_file_name, problems, "a")
 
-        print_results(problems, total, args.log, args.quiet)
+        print_results(problems, total, log_file_name, args.quiet)
 
         sys.exit(0 if not problems else 1)
 
