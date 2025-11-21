@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Проверка длинных путей и имен файлов для Linux с учетом системных ограничений
-v0.3 at 20.11.25
+Используйте ./too-long-for-linux.py --help для вывода справки
+v0.3 от 20.11.25
 """
 
 import argparse
@@ -25,29 +26,23 @@ def count_bytes(string):
 
 
 def safe_truncate(string, max_length=250):
-    """Безопасно обрезает строку до указанной длины в байтах с учетом UTF-8."""
     if count_bytes(string) <= max_length:
         return string
     return string.encode("utf-8")[:max_length].decode("utf-8", "ignore")
 
 
 def split_filename(filename, max_length=255):
-    """Разбивает имя файла на две части примерно пополам."""
     if count_bytes(filename) <= max_length:
         return filename, None
 
-    # Для файлов сохраняем расширение
     stem = Path(filename).stem
     suffix = Path(filename).suffix
 
-    # Находим точку разделения примерно посередине
     stem_bytes = count_bytes(stem)
     if stem_bytes > 1:
-        # Ищем границу, не разрывая UTF-8 символы
         stem_encoded = stem.encode("utf-8")
         split_point = len(stem_encoded) // 2
 
-        # Ищем границу символа
         while split_point > 0 and (stem_encoded[split_point] & 0xC0 == 0x80):
             split_point -= 1
 
@@ -57,30 +52,24 @@ def split_filename(filename, max_length=255):
         part1 = stem_encoded[:split_point].decode("utf-8", "ignore")
         part2 = stem_encoded[split_point:].decode("utf-8", "ignore") + suffix
 
-        # Если части все еще слишком длинные, обрезаем их до 250 байт
         if count_bytes(part1) > 255:
             part1 = safe_truncate(part1, 250)
         if count_bytes(part2) > 255:
             part2 = safe_truncate(part2, 250)
 
         return part1, part2
-    # Если основа имени слишком короткая, просто обрезаем до 250
     return safe_truncate(filename, 250), None
 
 
 def split_directory_name(dirname, max_length=255):
-    """Разбивает имя директории на две части примерно пополам."""
     if count_bytes(dirname) <= max_length:
         return dirname, None
 
-    # Находим точку разделения примерно посередине
     dirname_bytes = count_bytes(dirname)
     if dirname_bytes > 1:
-        # Ищем границу, не разрывая UTF-8 символы
         dirname_encoded = dirname.encode("utf-8")
         split_point = len(dirname_encoded) // 2
 
-        # Ищем границу символа
         while split_point > 0 and (dirname_encoded[split_point] & 0xC0 == 0x80):
             split_point -= 1
 
@@ -90,26 +79,22 @@ def split_directory_name(dirname, max_length=255):
         part1 = dirname_encoded[:split_point].decode("utf-8", "ignore")
         part2 = dirname_encoded[split_point:].decode("utf-8", "ignore")
 
-        # Если части все еще слишком длинные, обрезаем их до 250 байт
         if count_bytes(part1) > 255:
             part1 = safe_truncate(part1, 250)
         if count_bytes(part2) > 255:
             part2 = safe_truncate(part2, 250)
 
         return part1, part2
-    # Если имя слишком короткое, просто обрезаем до 250
     return safe_truncate(dirname, 250), None
 
 
 def create_safe_directory(base_path, desired_name, max_length=255):
-    """Создает директорию с безопасным именем."""
     safe_name = desired_name
     if count_bytes(safe_name) > max_length:
         safe_name = safe_truncate(safe_name, 250)
 
     full_path = base_path / safe_name
 
-    # Если директория уже существует, добавляем суффикс
     counter = 1
     while full_path.exists():
         safe_name = f"{Path(desired_name).stem[:200]}_{counter}"
@@ -123,11 +108,9 @@ def create_safe_directory(base_path, desired_name, max_length=255):
 
 
 def _fix_file_simple(path, parent_dir, original_name):
-    """Исправляет файл без разбиения имени."""
     new_filename = safe_truncate(original_name, 250)
     new_file_path = parent_dir / new_filename
 
-    # Если целевой файл уже существует, добавляем суффикс
     counter = 1
     while new_file_path.exists():
         stem = Path(original_name).stem
@@ -143,14 +126,10 @@ def _fix_file_simple(path, parent_dir, original_name):
 
 
 def _fix_file_split(path, parent_dir, original_name, part1, part2):
-    """Исправляет файл с разбиением имени."""
-    # Создаем директорию с первой частью имени
     new_dir = create_safe_directory(parent_dir, part1)
 
-    # Перемещаем файл с второй частью имени
     new_file_path = new_dir / part2
 
-    # Если целевой файл уже существует, добавляем суффикс
     counter = 1
     while new_file_path.exists():
         stem = Path(part2).stem
@@ -166,11 +145,9 @@ def _fix_file_split(path, parent_dir, original_name, part1, part2):
 
 
 def _fix_directory_simple(path, parent_dir, original_name):
-    """Исправляет директорию без разбиения имени."""
     new_dir_name = safe_truncate(original_name, 250)
     new_dir_path = parent_dir / new_dir_name
 
-    # Если целевая директория уже существует, добавляем суффикс
     counter = 1
     while new_dir_path.exists():
         new_dir_name = f"{Path(original_name).stem[:200]}_{counter}"
@@ -179,14 +156,11 @@ def _fix_directory_simple(path, parent_dir, original_name):
         new_dir_path = parent_dir / new_dir_name
         counter += 1
 
-    # Создаем целевую директорию
     new_dir_path.mkdir(parents=True, exist_ok=True)
 
-    # Перемещаем все содержимое
     for item in path.iterdir():
         shutil.move(str(item), str(new_dir_path / item.name))
 
-    # Удаляем исходную директорию (если она пуста)
     with contextlib.suppress(OSError):
         path.rmdir()
 
@@ -194,14 +168,10 @@ def _fix_directory_simple(path, parent_dir, original_name):
 
 
 def _fix_directory_split(path, parent_dir, original_name, part1, part2):
-    """Исправляет директорию с разбиением имени."""
-    # Создаем родительскую директорию с первой частью имени
     new_parent_dir = create_safe_directory(parent_dir, part1)
 
-    # Создаем целевую директорию со второй частью имени
     new_dir_path = new_parent_dir / part2
 
-    # Если целевая директория уже существует, добавляем суффикс
     counter = 1
     while new_dir_path.exists():
         new_part2 = f"{Path(part2).stem[:200]}_{counter}"
@@ -210,14 +180,11 @@ def _fix_directory_split(path, parent_dir, original_name, part1, part2):
         new_dir_path = new_parent_dir / new_part2
         counter += 1
 
-    # Создаем целевую директорию
     new_dir_path.mkdir(parents=True, exist_ok=True)
 
-    # Перемещаем все содержимое
     for item in path.iterdir():
         shutil.move(str(item), str(new_dir_path / item.name))
 
-    # Удаляем исходную директорию (если она пуста)
     with contextlib.suppress(OSError):
         path.rmdir()
 
@@ -225,11 +192,9 @@ def _fix_directory_split(path, parent_dir, original_name, part1, part2):
 
 
 def fix_long_name(problem_type, length, path_str):
-    """Исправляет длинное имя файла или директории."""
     path = Path(path_str)
 
     if "FILE_NAME" in problem_type:
-        # Для файлов: разбиваем имя и создаем вложенную структуру
         parent_dir = path.parent
         original_name = path.name
 
@@ -240,7 +205,6 @@ def fix_long_name(problem_type, length, path_str):
         return _fix_file_split(path, parent_dir, original_name, part1, part2)
 
     if "DIR_NAME" in problem_type:
-        # Для директорий: разбиваем имя и создаем вложенную структуру
         parent_dir = path.parent
         original_name = path.name
 
@@ -254,7 +218,6 @@ def fix_long_name(problem_type, length, path_str):
 
 
 def scan_directory(directory, show_progress=True):
-    """Сканирует директорию на предмет длинных имен и путей."""
     problems = []
     total_count = 0
 
@@ -267,7 +230,6 @@ def scan_directory(directory, show_progress=True):
     current_count = 0
 
     for root, dirs, files in os.walk(directory):
-        # Обработка директорий
         for dir_name in dirs:
             current_count += 1
             full_path = Path(root) / dir_name
@@ -282,7 +244,6 @@ def scan_directory(directory, show_progress=True):
 
             _update_progress(show_progress, current_count, total_count)
 
-        # Обработка файлов
         for file_name in files:
             current_count += 1
             full_path = Path(root) / file_name
@@ -304,7 +265,6 @@ def scan_directory(directory, show_progress=True):
 
 
 def _update_progress(show_progress, current_count, total_count):
-    """Обновляет индикатор прогресса."""
     if show_progress and current_count % 100 == 0 and total_count > 0:
         progress = (current_count / total_count) * 100
         print(
@@ -315,8 +275,6 @@ def _update_progress(show_progress, current_count, total_count):
 
 
 def parse_arguments():
-    """Парсит аргументы командной строки."""
-
     class RussianFormatter(argparse.RawDescriptionHelpFormatter):
         def __init__(self, prog):
             super().__init__(prog, width=80, max_help_position=30)
@@ -362,14 +320,12 @@ def parse_arguments():
 
 
 def validate_directory(directory):
-    """Проверяет существование директории."""
     if not Path(directory).is_dir():
         print(f"Ошибка: Директория '{directory}' не существует", file=sys.stderr)
         sys.exit(1)
 
 
 def save_results_to_log(log_file, problems):
-    """Сохраняет результаты в файл."""
     with Path(log_file).open("w", encoding="utf-8") as file:
         for problem_type, length, path in problems:
             if "NAME" in problem_type:
@@ -379,12 +335,10 @@ def save_results_to_log(log_file, problems):
 
 
 def apply_fixes(problems):
-    """Применяет исправления к найденным проблемам."""
     if not problems:
         print(f"{Colors.GREEN}Нет проблем для исправления{Colors.RESET}")
         return
 
-    # Разделяем проблемы на исправляемые (NAME) и только для информации (PATH)
     name_problems = [p for p in problems if "NAME" in p[0]]
     path_problems = [p for p in problems if "PATH" in p[0]]
 
@@ -424,7 +378,6 @@ def apply_fixes(problems):
 
 
 def print_results(problems, total, log_file=None, quiet=False):
-    """Выводит результаты проверки."""
     if quiet:
         name_count = len([p for p in problems if "NAME" in p[0]])
         path_count = len([p for p in problems if "PATH" in p[0]])
@@ -461,7 +414,6 @@ def print_results(problems, total, log_file=None, quiet=False):
 
 
 def main():
-    """Основная функция."""
     args = parse_arguments()
     validate_directory(args.directory)
 
@@ -470,7 +422,6 @@ def main():
 
         if args.axe:
             apply_fixes(problems)
-            # После исправлений сканируем еще раз
             problems, total = scan_directory(args.directory, not args.no_progress)
 
         if args.log:
@@ -478,7 +429,6 @@ def main():
 
         print_results(problems, total, args.log, args.quiet)
 
-        # Возвращаем код ошибки, если остались проблемы
         sys.exit(0 if not problems else 1)
 
     except KeyboardInterrupt:
