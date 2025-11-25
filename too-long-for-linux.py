@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
-Проверка длинных путей и имен файлов для Linux с учетом системных ограничений
-Используйте ./too-long-for-linux.py --help для вывода справки
-v0.4 от 21.11.25
+Проверка и исправление длинных путей/имен файлов в Linux.
+v0.5 (25.11.25)
 """
 
 import argparse
-import contextlib
+import logging
 import os
 import shutil
 import sys
-from datetime import datetime
+from collections.abc import Generator
+from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
+
+
+# --- Константы ---
+MAX_FILENAME_BYTES = 255
+MAX_PATH_BYTES = 4096
+SAFE_LENGTH = 250
+SAFE_STEM_LENGTH = 200
 
 
 class Colors:
@@ -19,454 +27,330 @@ class Colors:
     GREEN = "\033[92m"
     BLUE = "\033[94m"
     BOLD = "\033[1m"
+    RED = "\033[91m"
     RESET = "\033[0m"
 
 
-def count_bytes(string):
-    return len(string.encode("utf-8"))
+class ProblemType(Enum):
+    FILE_NAME = auto()
+    DIR_NAME = auto()
+    FILE_PATH = auto()
+    DIR_PATH = auto()
 
 
-def safe_truncate(string, max_length=250):
-    if count_bytes(string) <= max_length:
-        return string
-    return string.encode("utf-8")[:max_length].decode("utf-8", "ignore")
+@dataclass
+class Problem:
+    type: ProblemType
+    current_length: int
+    path: Path
+
+    @property
+    def description(self) -> str:
+        if self.type in (ProblemType.FILE_NAME, ProblemType.DIR_NAME):
+            return f"ДЛИННОЕ ИМЯ [{self.current_length}/{MAX_FILENAME_BYTES}]"
+        return f"ДЛИННЫЙ ПУТЬ [{self.current_length}/{MAX_PATH_BYTES}]"
 
 
-def split_filename(filename, max_length=255):
-    if count_bytes(filename) <= max_length:
-        return filename, None
-
-    stem = Path(filename).stem
-    suffix = Path(filename).suffix
-
-    stem_bytes = count_bytes(stem)
-    if stem_bytes > 1:
-        stem_encoded = stem.encode("utf-8")
-        split_point = len(stem_encoded) // 2
-
-        while split_point > 0 and (stem_encoded[split_point] & 0xC0 == 0x80):
-            split_point -= 1
-
-        if split_point == 0:
-            split_point = len(stem_encoded) // 2  # fallback
-
-        part1 = stem_encoded[:split_point].decode("utf-8", "ignore")
-        part2 = stem_encoded[split_point:].decode("utf-8", "ignore") + suffix
-
-        if count_bytes(part1) > 255:
-            part1 = safe_truncate(part1, 250)
-        if count_bytes(part2) > 255:
-            part2 = safe_truncate(part2, 250)
-
-        return part1, part2
-    return safe_truncate(filename, 250), None
+# --- Работа со строками и байтами ---
 
 
-def split_directory_name(dirname, max_length=255):
-    if count_bytes(dirname) <= max_length:
-        return dirname, None
-
-    dirname_bytes = count_bytes(dirname)
-    if dirname_bytes > 1:
-        dirname_encoded = dirname.encode("utf-8")
-        split_point = len(dirname_encoded) // 2
-
-        while split_point > 0 and (dirname_encoded[split_point] & 0xC0 == 0x80):
-            split_point -= 1
-
-        if split_point == 0:
-            split_point = len(dirname_encoded) // 2  # fallback
-
-        part1 = dirname_encoded[:split_point].decode("utf-8", "ignore")
-        part2 = dirname_encoded[split_point:].decode("utf-8", "ignore")
-
-        if count_bytes(part1) > 255:
-            part1 = safe_truncate(part1, 250)
-        if count_bytes(part2) > 255:
-            part2 = safe_truncate(part2, 250)
-
-        return part1, part2
-    return safe_truncate(dirname, 250), None
+def count_bytes(s: str) -> int:
+    return len(s.encode("utf-8"))
 
 
-def create_safe_directory(base_path, desired_name, max_length=255):
-    safe_name = desired_name
-    if count_bytes(safe_name) > max_length:
-        safe_name = safe_truncate(safe_name, 250)
+def safe_truncate(s: str, max_bytes: int = SAFE_LENGTH) -> str:
+    """Обрезает строку до указанного кол-ва байт, сохраняя валидность UTF-8."""
+    if count_bytes(s) <= max_bytes:
+        return s
+    encoded = s.encode("utf-8")
+    # Обрезаем и декодируем с игнорированием ошибок, чтобы убрать битый последний символ
+    return encoded[:max_bytes].decode("utf-8", "ignore")
 
-    full_path = base_path / safe_name
+
+def split_string_utf8(s: str) -> tuple[str, str]:
+    """Разделяет строку пополам с учетом границ UTF-8 символов."""
+    encoded = s.encode("utf-8")
+    split_point = len(encoded) // 2
+
+    # Сдвигаемся назад, пока не найдем начало символа (старшие биты не 10xxxxxx)
+    while split_point > 0 and (encoded[split_point] & 0xC0 == 0x80):
+        split_point -= 1
+
+    if split_point == 0:
+        split_point = len(encoded) // 2  # Fallback
+
+    part1 = encoded[:split_point].decode("utf-8", "ignore")
+    part2 = encoded[split_point:].decode("utf-8", "ignore")
+    return part1, part2
+
+
+def get_unique_path(
+    directory: Path, stem: str, suffix: str = "", is_dir: bool = False
+) -> Path:
+    """Генерирует уникальный путь, добавляя счетчик, если файл существует."""
+    # Первичная проверка длины
+    name = safe_truncate(stem + suffix, SAFE_LENGTH)
+    candidate = directory / name
 
     counter = 1
-    while full_path.exists():
-        safe_name = f"{Path(desired_name).stem[:200]}_{counter}"
-        if count_bytes(safe_name) > max_length:
-            safe_name = safe_truncate(safe_name, 250)
-        full_path = base_path / safe_name
+    while candidate.exists():
+        # Формируем имя с счетчиком, обрезая stem, чтобы влезть в лимит
+        base_stem = safe_truncate(stem, SAFE_STEM_LENGTH)
+        name = f"{base_stem}_{counter}{suffix}"
+
+        # Финальная проверка на случай если суффикс очень длинный
+        if count_bytes(name) > MAX_FILENAME_BYTES:
+            name = safe_truncate(name, SAFE_LENGTH)
+
+        candidate = directory / name
         counter += 1
 
-    full_path.mkdir(parents=True, exist_ok=True)
-    return full_path
+    return candidate
 
 
-def _fix_file_simple(path, parent_dir, original_name):
-    new_filename = safe_truncate(original_name, 250)
-    new_file_path = parent_dir / new_filename
-
-    counter = 1
-    while new_file_path.exists():
-        stem = Path(original_name).stem
-        suffix = Path(original_name).suffix
-        new_filename = f"{stem[:200]}_{counter}{suffix}"
-        if count_bytes(new_filename) > 255:
-            new_filename = safe_truncate(new_filename, 250)
-        new_file_path = parent_dir / new_filename
-        counter += 1
-
-    shutil.move(str(path), str(new_file_path))
-    return f"Файл переименован: {path} -> {new_file_path}"
+# --- Основная логика ---
 
 
-def _fix_file_split(path, parent_dir, original_name, part1, part2):
-    new_dir = create_safe_directory(parent_dir, part1)
+class Scanner:
+    def __init__(self, root_dir: str):
+        self.root_dir = Path(root_dir)
+        self.total_scanned = 0
 
-    new_file_path = new_dir / part2
+    def scan(self, show_progress: bool = True) -> Generator[Problem, None, None]:
+        total_items = 0
+        if show_progress:
+            print("Подсчет файлов...", end=" ", flush=True)
+            for _, dirs, files in os.walk(self.root_dir):
+                total_items += len(dirs) + len(files)
+            print(f"найдено: {total_items}")
 
-    counter = 1
-    while new_file_path.exists():
-        stem = Path(part2).stem
-        suffix = Path(part2).suffix
-        new_part2 = f"{stem[:200]}_{counter}{suffix}"
-        if count_bytes(new_part2) > 255:
-            new_part2 = safe_truncate(new_part2, 250)
-        new_file_path = new_dir / new_part2
-        counter += 1
+        self.total_scanned = 0
 
-    shutil.move(str(path), str(new_file_path))
-    return f"Файл перемещен: {path} -> {new_file_path}"
+        for root, dirs, files in os.walk(self.root_dir):
+            # Проверяем директории
+            for d in dirs:
+                yield from self._check_item(Path(root), d, is_dir=True)
+                self._update_progress(show_progress, total_items)
 
+            # Проверяем файлы
+            for f in files:
+                yield from self._check_item(Path(root), f, is_dir=False)
+                self._update_progress(show_progress, total_items)
 
-def _fix_directory_simple(path, parent_dir, original_name):
-    new_dir_name = safe_truncate(original_name, 250)
-    new_dir_path = parent_dir / new_dir_name
+        if show_progress:
+            print(f"\rСканирование: 100.0% ({self.total_scanned}/{self.total_scanned})")
 
-    counter = 1
-    while new_dir_path.exists():
-        new_dir_name = f"{Path(original_name).stem[:200]}_{counter}"
-        if count_bytes(new_dir_name) > 255:
-            new_dir_name = safe_truncate(new_dir_name, 250)
-        new_dir_path = parent_dir / new_dir_name
-        counter += 1
+    def _check_item(
+        self, root: Path, name: str, is_dir: bool
+    ) -> Generator[Problem, None, None]:
+        self.total_scanned += 1
+        full_path = root / name
+        name_len = count_bytes(name)
+        path_len = count_bytes(str(full_path))
 
-    new_dir_path.mkdir(parents=True, exist_ok=True)
+        if name_len >= MAX_FILENAME_BYTES:
+            p_type = ProblemType.DIR_NAME if is_dir else ProblemType.FILE_NAME
+            yield Problem(p_type, name_len, full_path)
 
-    for item in path.iterdir():
-        shutil.move(str(item), str(new_dir_path / item.name))
+        if path_len >= MAX_PATH_BYTES:
+            p_type = ProblemType.DIR_PATH if is_dir else ProblemType.FILE_PATH
+            yield Problem(p_type, path_len, full_path)
 
-    with contextlib.suppress(OSError):
-        path.rmdir()
-
-    return f"Директория переименована: {path} -> {new_dir_path}"
-
-
-def _fix_directory_split(path, parent_dir, original_name, part1, part2):
-    new_parent_dir = create_safe_directory(parent_dir, part1)
-
-    new_dir_path = new_parent_dir / part2
-
-    counter = 1
-    while new_dir_path.exists():
-        new_part2 = f"{Path(part2).stem[:200]}_{counter}"
-        if count_bytes(new_part2) > 255:
-            new_part2 = safe_truncate(new_part2, 250)
-        new_dir_path = new_parent_dir / new_part2
-        counter += 1
-
-    new_dir_path.mkdir(parents=True, exist_ok=True)
-
-    for item in path.iterdir():
-        shutil.move(str(item), str(new_dir_path / item.name))
-
-    with contextlib.suppress(OSError):
-        path.rmdir()
-
-    return f"Директория перемещена: {path} -> {new_dir_path}"
+    def _update_progress(self, show_progress: bool, total: int):
+        if show_progress and total > 0 and self.total_scanned % 100 == 0:
+            percent = (self.total_scanned / total) * 100
+            print(
+                f"\rСканирование: {percent:.1f}% ({self.total_scanned}/{total})",
+                end="",
+                flush=True,
+            )
 
 
-def fix_long_name(problem_type, length, path_str):
-    path = Path(path_str)
+class Fixer:
+    @staticmethod
+    def fix_problem(problem: Problem) -> str:
+        path_error_msg = "Автоматическое исправление путей пока не поддерживается."
+        if "PATH" in problem.type.name:
+            raise ValueError(path_error_msg)
 
-    if "FILE_NAME" in problem_type:
-        parent_dir = path.parent
+        path = problem.path
+        parent = path.parent
         original_name = path.name
 
-        part1, part2 = split_filename(original_name)
+        # Стратегия разделения (Split)
+        if count_bytes(original_name) > MAX_FILENAME_BYTES:
+            # Пытаемся разбить имя на папку и файл, чтобы сохранить структуру
+            stem = path.stem
+            suffix = path.suffix if not path.is_dir() else ""
 
-        if part2 is None:
-            return _fix_file_simple(path, parent_dir, original_name)
-        return _fix_file_split(path, parent_dir, original_name, part1, part2)
+            # Если имя без расширения тоже гигантское, режем его
+            stem_bytes = count_bytes(stem)
 
-    if "DIR_NAME" in problem_type:
-        parent_dir = path.parent
-        original_name = path.name
+            if stem_bytes > 1:
+                part1, part2 = split_string_utf8(stem)
+                part2 += suffix
 
-        part1, part2 = split_directory_name(original_name)
+                # Обрезаем части если они всё еще велики
+                part1 = safe_truncate(part1, SAFE_LENGTH)
+                part2 = safe_truncate(part2, SAFE_LENGTH)
 
-        if part2 is None:
-            return _fix_directory_simple(path, parent_dir, original_name)
-        return _fix_directory_split(path, parent_dir, original_name, part1, part2)
+                # Создаем папку из первой части
+                new_parent_dir = get_unique_path(parent, part1, is_dir=True)
+                new_parent_dir.mkdir(parents=True, exist_ok=True)
 
-    return "Неизвестный тип проблемы"
+                # Перемещаем внутрь новой папки
+                new_path = get_unique_path(
+                    new_parent_dir, Path(part2).stem, Path(part2).suffix
+                )
 
+                shutil.move(str(path), str(new_path))
 
-def scan_directory(directory, show_progress=True):
-    problems = []
-    total_count = 0
+                # Если это была директория, удаляем пустую старую (если shutil.move ее не удалил)
+                if path.is_dir() and path.exists() and not any(path.iterdir()):
+                    path.rmdir()
 
-    if show_progress:
-        print("Подсчет файлов...", end=" ", flush=True)
-        for _root, dirs, files in os.walk(directory):
-            total_count += len(dirs) + len(files)
-        print(f"найдено: {total_count}")
+                return f"Перемещено (split): {path.name} -> {new_parent_dir.name}/{new_path.name}"
 
-    current_count = 0
+        # Fallback: простое переименование (Truncate)
+        safe_name = safe_truncate(original_name, SAFE_LENGTH)
+        new_path = get_unique_path(parent, Path(safe_name).stem, Path(safe_name).suffix)
 
-    for root, dirs, files in os.walk(directory):
-        for dir_name in dirs:
-            current_count += 1
-            full_path = Path(root) / dir_name
-
-            name_bytes = count_bytes(dir_name)
-            if name_bytes >= 255:
-                problems.append(("DIR_NAME", name_bytes, str(full_path)))
-
-            path_bytes = count_bytes(str(full_path))
-            if path_bytes >= 4096:
-                problems.append(("DIR_PATH", path_bytes, str(full_path)))
-
-            _update_progress(show_progress, current_count, total_count)
-
-        for file_name in files:
-            current_count += 1
-            full_path = Path(root) / file_name
-
-            name_bytes = count_bytes(file_name)
-            if name_bytes >= 255:
-                problems.append(("FILE_NAME", name_bytes, str(full_path)))
-
-            path_bytes = count_bytes(str(full_path))
-            if path_bytes >= 4096:
-                problems.append(("FILE_PATH", path_bytes, str(full_path)))
-
-            _update_progress(show_progress, current_count, total_count)
-
-    if show_progress:
-        print(f"\rСканирование: 100.0% ({current_count}/{current_count})")
-
-    return problems, current_count
+        shutil.move(str(path), str(new_path))
+        return f"Переименовано (truncate): {path.name} -> {new_path.name}"
 
 
-def _update_progress(show_progress, current_count, total_count):
-    if show_progress and current_count % 100 == 0 and total_count > 0:
-        progress = (current_count / total_count) * 100
+class Reporter:
+    @staticmethod
+    def print_summary(
+        problems: list[Problem],
+        total_scanned: int,
+        log_file: str | None = None,
+        quiet: bool = False,
+    ):
+        name_problems = [p for p in problems if "NAME" in p.type.name]
+        path_problems = [p for p in problems if "PATH" in p.type.name]
+
+        if quiet:
+            print(f"{len(name_problems)} {len(path_problems)} {total_scanned}")
+            return
+
+        print(f"\n{Colors.BOLD}РЕЗУЛЬТАТЫ ПРОВЕРКИ:{Colors.RESET}")
+        print(f"Всего проверено: {Colors.BLUE}{total_scanned}{Colors.RESET}")
         print(
-            f"\rСканирование: {progress:.1f}% ({current_count}/{total_count})",
-            end="",
-            flush=True,
+            f"Длинных имен (>255 байт): {Colors.YELLOW}{len(name_problems)}{Colors.RESET}"
+        )
+        print(
+            f"Длинных путей (>4096 байт): {Colors.YELLOW}{len(path_problems)}{Colors.RESET}"
         )
 
+        if not problems:
+            print(
+                f"\n{Colors.GREEN}Все пути и имена соответствуют ограничениям Linux{Colors.RESET}"
+            )
+        else:
+            print(f"\n{Colors.BOLD}ДЕТАЛИЗАЦИЯ:{Colors.RESET}")
+            for p in problems:
+                print(f"  {p.description}: {p.path}")
 
-def parse_arguments():
-    class RussianFormatter(argparse.RawDescriptionHelpFormatter):
-        def __init__(self, prog):
-            super().__init__(prog, width=80, max_help_position=30)
+        if log_file:
+            Reporter._write_log(log_file, problems)
+            print(f"\n{Colors.BLUE}Отчет сохранен в: {log_file}{Colors.RESET}")
 
-        def add_usage(self, usage, actions, groups, prefix=None):
-            if prefix is None:
-                prefix = "Использование: "
-            return super().add_usage(usage, actions, groups, prefix)
+    @staticmethod
+    def _write_log(filepath: str, problems: list[Problem]):
+        try:
+            with Path(filepath).open("a", encoding="utf-8") as f:
+                f.write(f"\n{'=' * 60}\n")
+                f.write(
+                    f"Проверка {logging.Formatter('%(asctime)s').format(logging.LogRecord('', 0, '', '', 0, 0, 0))}\n"
+                )
+                f.write(f"{'=' * 60}\n")
+                if not problems:
+                    f.write("Нет проблем.\n")
+                for p in problems:
+                    f.write(f"{p.description}: {p.path}\n")
+        except OSError as e:
+            print(f"{Colors.RED}Ошибка записи лога: {e}{Colors.RESET}", file=sys.stderr)
 
+
+# --- Аргументы командной строки ---
+
+
+def parse_args():
     parser = argparse.ArgumentParser(
-        description="Проверка длинных путей и имен файлов для Linux",
-        formatter_class=RussianFormatter,
-        add_help=False,
+        description="Проверка и исправление длинных путей/имен файлов Linux",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-
     parser.add_argument(
         "directory", nargs="?", default=".", help="Директория для проверки"
     )
-
     parser.add_argument(
-        "-h",
-        "--help",
-        action="help",
-        default=argparse.SUPPRESS,
-        help="Показать это сообщение и выйти",
+        "-p", "--no-progress", action="store_true", help="Скрыть прогресс"
+    )
+    parser.add_argument("-q", "--quiet", action="store_true", help="Тихий режим")
+    parser.add_argument(
+        "-l", "--log", nargs="?", const="AUTO", metavar="FILE", help="Файл лога"
     )
     parser.add_argument(
-        "-p", "--no-progress", action="store_true", help="Отключить индикатор прогресса"
+        "--axe", action="store_true", help="АВТОМАТИЧЕСКОЕ исправление имен (опасно!)"
     )
-    parser.add_argument(
-        "-q", "--quiet", action="store_true", help="Тихий режим (только цифры)"
-    )
-    parser.add_argument(
-        "-l",
-        "--log",
-        nargs="?",
-        const="AUTO",
-        metavar="ФАЙЛ",
-        help="Сохранить результаты в указанный файл (если указан без файла, используется автоматическое имя)",
-    )
-    parser.add_argument(
-        "--axe",
-        action="store_true",
-        help="Автоматическое исправление длинных имён файлов/директорий. Может потребовать права root. Использовать с осторожностью!",
-    )
-
     return parser.parse_args()
 
 
-def get_auto_log_name():
-    cwd = Path.cwd()
-    basename = cwd.name
-    if not basename:
-        basename = "root"
-    return f"{basename}.LOG"
-
-
-def validate_directory(directory):
-    if not Path(directory).is_dir():
-        print(f"Ошибка: Директория '{directory}' не существует", file=sys.stderr)
-        sys.exit(1)
-
-
-def write_log_report(log_file, problems, mode="a"):
-    with Path(log_file).open(mode, encoding="utf-8") as file:
-        if mode == "a":
-            file.write(f"\n{'=' * 60}\n")
-            file.write(f"Проверка от {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            file.write(f"{'=' * 60}\n")
-
-        if problems:
-            for problem_type, length, path in problems:
-                if "NAME" in problem_type:
-                    file.write(f"ДЛИННОЕ ИМЯ [{length}/255]: {path}\n")
-                else:
-                    file.write(f"ДЛИННЫЙ ПУТЬ [{length}/4096]: {path}\n")
-        else:
-            file.write("Все пути и имена соответствуют ограничениям Linux\n")
-
-
-def apply_fixes(problems):
-    if not problems:
-        print(f"{Colors.GREEN}Нет проблем для исправления{Colors.RESET}")
-        return
-
-    name_problems = [p for p in problems if "NAME" in p[0]]
-    path_problems = [p for p in problems if "PATH" in p[0]]
-
-    if path_problems:
-        print(
-            f"{Colors.YELLOW}Предупреждение: длинные пути не исправляются автоматически:{Colors.RESET}"
-        )
-        for _problem_type, length, path in path_problems:
-            print(f"  ДЛИННЫЙ ПУТЬ [{length}/4096]: {path}")
-        print()
-
-    if not name_problems:
-        print(f"{Colors.GREEN}Нет длинных имен для исправления{Colors.RESET}")
-        return
-
-    print(f"{Colors.BOLD}Применение исправлений к длинным именам:{Colors.RESET}")
-
-    fixed_count = 0
-    for i, (problem_type, length, path) in enumerate(name_problems, 1):
-        print(f"{i}/{len(name_problems)}: {path}")
-
-        try:
-            result = fix_long_name(problem_type, length, path)
-            print(f"  {Colors.GREEN}{result}{Colors.RESET}")
-            fixed_count += 1
-        except (OSError, shutil.Error, ValueError) as e:
-            print(f"  {Colors.YELLOW}Ошибка: {e}{Colors.RESET}")
-
-    print(
-        f"{Colors.BOLD}Исправлено проблем: {fixed_count}/{len(name_problems)}{Colors.RESET}"
-    )
-
-    if path_problems:
-        print(
-            f"\n{Colors.YELLOW}Остались длинные пути (требуют ручного исправления): {len(path_problems)}{Colors.RESET}"
-        )
-
-
-def print_results(problems, total, log_file=None, quiet=False):
-    if quiet:
-        name_count = len([p for p in problems if "NAME" in p[0]])
-        path_count = len([p for p in problems if "PATH" in p[0]])
-        print(f"{name_count} {path_count} {total}")
-        return
-
-    print(f"\n{Colors.BOLD}РЕЗУЛЬТАТЫ ПРОВЕРКИ:{Colors.RESET}")
-    print(f"Всего проверено: {Colors.BLUE}{total}{Colors.RESET}")
-
-    name_problems = [p for p in problems if "NAME" in p[0]]
-    path_problems = [p for p in problems if "PATH" in p[0]]
-
-    print(
-        f"Длинных имен (>255 байт): {Colors.YELLOW}{len(name_problems)}{Colors.RESET}"
-    )
-    print(
-        f"Длинных путей (>4096 байт): {Colors.YELLOW}{len(path_problems)}{Colors.RESET}"
-    )
-
-    if problems:
-        print(f"\n{Colors.BOLD}ПРОБЛЕМНЫЕ ФАЙЛЫ И ДИРЕКТОРИИ:{Colors.RESET}")
-        for problem_type, length, path in problems:
-            if "NAME" in problem_type:
-                print(f"  ДЛИННОЕ ИМЯ [{length}/255]: {path}")
-            else:
-                print(f"  ДЛИННЫЙ ПУТЬ [{length}/4096]: {path}")
-    else:
-        print(
-            f"\n{Colors.GREEN}Все пути и имена соответствуют ограничениям Linux{Colors.RESET}"
-        )
-
-    if log_file:
-        print(f"\n{Colors.BLUE}Подробный отчет сохранен в: {log_file}{Colors.RESET}")
+# --- Точка входа ---
 
 
 def main():
-    args = parse_arguments()
-    validate_directory(args.directory)
+    args = parse_args()
 
-    log_file_name = None
-    if args.log == "AUTO":
-        log_file_name = get_auto_log_name()
-    elif args.log is not None:
-        log_file_name = args.log
-    elif len(sys.argv) == 1:
-        log_file_name = get_auto_log_name()
+    if not Path(args.directory).is_dir():
+        print(
+            f"{Colors.RED}Ошибка: {args.directory} не является директорией{Colors.RESET}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
+    # 1. Сканирование
+    scanner = Scanner(args.directory)
     try:
-        problems, total = scan_directory(args.directory, not args.no_progress)
-
-        if args.axe:
-            apply_fixes(problems)
-            problems, total = scan_directory(args.directory, not args.no_progress)
-
-        if log_file_name:
-            write_log_report(log_file_name, problems, "a")
-
-        print_results(problems, total, log_file_name, args.quiet)
-
-        sys.exit(0 if not problems else 1)
-
+        problems = list(
+            scanner.scan(show_progress=not args.no_progress and not args.quiet)
+        )
     except KeyboardInterrupt:
-        print("\nПроверка прервана пользователем")
+        print("\nПрервано пользователем")
         sys.exit(1)
-    except (OSError, ValueError, PermissionError) as error:
-        print(f"Ошибка при выполнении: {error}", file=sys.stderr)
-        sys.exit(1)
+
+    # 2. Исправление (если запрошено)
+    if args.axe and problems:
+        print(f"\n{Colors.BOLD}Запуск исправлений...{Colors.RESET}")
+        fixed_count = 0
+        remaining_problems = []
+
+        for p in problems:
+            if "NAME" in p.type.name:
+                try:
+                    msg = Fixer.fix_problem(p)
+                    print(f"  {Colors.GREEN}FIXED:{Colors.RESET} {msg}")
+                    fixed_count += 1
+                except (OSError, ValueError) as e:
+                    print(f"  {Colors.RED}ERROR:{Colors.RESET} {p.path} -> {e}")
+                    remaining_problems.append(p)
+            else:
+                remaining_problems.append(p)  # Пути не чиним
+
+        print(
+            f"Исправлено: {fixed_count}/{len(problems) - len([x for x in problems if 'PATH' in x.type.name])}"
+        )
+        problems = remaining_problems
+
+    # 3. Отчет
+    log_name = args.log
+    if log_name == "AUTO":
+        log_name = f"{Path.cwd().name or 'root'}.LOG"
+
+    Reporter.print_summary(problems, scanner.total_scanned, log_name, args.quiet)
+
+    sys.exit(1 if problems else 0)
 
 
 if __name__ == "__main__":
